@@ -47,20 +47,38 @@ contract MockUSDT is IERC20 {
 }
 
 contract JobRollTest is Test {
+    
     JobRoll jobroll;
     MockUSDT usdt;
     address client = address(0x1);
     address freelancer = address(0x2);
+    address approval = address(0x3);
 
     function setUp() public {
         usdt = new MockUSDT();
         jobroll = new JobRoll(address(usdt));
         jobroll.setMaxExpiry(30 days);
 
-        // Mint USDT to client
+        // Set approval address for approving freelancers
+        vm.prank(jobroll.owner());
+        jobroll.updateApprovalAddress(approval);
+
+        // Mint USDT to client and freelancer
         usdt.mint(client, 1000e6);
+        usdt.mint(freelancer, 1000e6);
+
         vm.prank(client);
         usdt.approve(address(jobroll), 1000e6);
+
+        vm.prank(freelancer);
+        usdt.approve(address(jobroll), 1000e6);
+
+        // Register and approve freelancer
+        vm.prank(freelancer);
+        jobroll.registerAsFreelancer();
+
+        vm.prank(approval);
+        jobroll.approveFreelancer(freelancer);
     }
 
     function test_PostJob() public {
@@ -116,7 +134,7 @@ contract JobRollTest is Test {
         assertEq(selectedFreelancer, freelancer, "Freelancer mismatch");
         assertEq(reward, amount, "Reward mismatch");
 
-        (uint256 totalEarned, uint256 completedJobs, uint256 withdrawableBalance) = jobroll.freelancers(freelancer);
+        (,, uint256 totalEarned, uint256 completedJobs, uint256 withdrawableBalance) = jobroll.freelancers(freelancer);
         assertEq(totalEarned, amount, "Total earned mismatch");
         assertEq(completedJobs, 1, "Completed jobs mismatch");
         assertEq(withdrawableBalance, amount, "Withdrawable mismatch");
@@ -148,7 +166,7 @@ contract JobRollTest is Test {
         uint256 afterBalance = usdt.balanceOf(freelancer);
 
         assertEq(afterBalance - prevBalance, expected, "Withdraw amount mismatch");
-        (,,uint256 withdrawableBalance) = jobroll.freelancers(freelancer);
+        (,,,, uint256 withdrawableBalance) = jobroll.freelancers(freelancer);
         assertEq(withdrawableBalance, 0, "Withdrawable should be 0");
     }
 
@@ -163,5 +181,26 @@ contract JobRollTest is Test {
         vm.expectRevert();
         vm.prank(client);
         jobroll.transferFrom(client, freelancer, 1);
+    }
+
+    function test_ClaimUnfinishedJob() public {
+        uint256 amount = 10e6;
+        uint256 expiresAt = block.timestamp + 1 days;
+
+        vm.prank(client);
+        jobroll.postJob(amount, expiresAt);
+
+        // Fast forward time after expiry
+        vm.warp(expiresAt + 1);
+
+        vm.prank(client);
+        jobroll.claimUnfinishedJob(1);
+
+        (, , , bool active, bool cancelled,,,) = jobroll.jobs(1);
+        assertTrue(cancelled, "Should be cancelled");
+        assertFalse(active, "Should not be active");
+        // NFT should be burned, so ownerOf(1) should revert
+        vm.expectRevert();
+        jobroll.ownerOf(1);
     }
 }

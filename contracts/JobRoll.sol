@@ -11,11 +11,14 @@ interface IERC5192 {
 contract JobRoll is Ownable, ERC721, IERC5192 {
     IERC20 private usdt;
 
+    address private approvalAddress; // Address that can approve freelancers
+
     uint256 public withdrawFee;     // e.g. 50 = 0.5%
     uint256 public maxExpiry;       // max job duration in seconds
     uint256 constant FEE_DENOMINATOR = 10000;
+    uint16 constant MAX_APPLICANTS = 50; // Max applicants per job
 
-    uint256 public jobCounter;
+    uint256 public jobCounterId;
 
     struct Job {
         address client;
@@ -30,14 +33,17 @@ contract JobRoll is Ownable, ERC721, IERC5192 {
     }
 
     struct FreelancerInfo {
-        uint256 totalEarned;
-        uint256 completedJobs;
-        uint256 withdrawableBalance;
+        bool isRegistered;             // True if the freelancer paid the registration fee
+        bool isFreelancer;             // True if the platform approved the freelancer
+        uint256 totalEarned;           // Total USDT earned from jobs
+        uint256 completedJobs;         // Number of jobs successfully completed
+        uint256 withdrawableBalance;   // Earnings that can be withdrawn
     }
 
     mapping(uint256 => bool) private _locked;
     mapping(uint256 => Job) public jobs;
     mapping(address => FreelancerInfo) public freelancers;
+    mapping(uint256 => mapping(address => bool)) public hasApplied;
 
     event JobPosted(uint256 indexed jobId, address indexed client, uint256 amount, uint256 expiresAt);
     event JobCancelled(uint256 indexed jobId, uint256 refundedAmount);
@@ -47,11 +53,19 @@ contract JobRoll is Ownable, ERC721, IERC5192 {
 
     constructor(address _usdt) Ownable(_msgSender()) ERC721("Job Roll", "JOBROLL") {
         usdt = IERC20(_usdt);
-        jobCounter = 1; // Start job ID from 1
+        jobCounterId = 1; // Start job ID from 1
     }
 
     function locked(uint256 tokenId) external view override returns (bool) {
         return _locked[tokenId];
+    }
+
+    function registerAsFreelancer() external {
+        address who = _msgSender();
+        require(!freelancers[who].isRegistered, "Already registered");
+        require(usdt.transferFrom(who, owner(), 1e6), "1 USDT fee required");
+
+        freelancers[who].isRegistered = true;
     }
 
     function postJob(uint256 amount, uint256 expiresAt) external {
@@ -60,32 +74,40 @@ contract JobRoll is Ownable, ERC721, IERC5192 {
         assembly {
             size := extcodesize(who)
         }
-        require(size == 0, "Contracts not allowed");
+        require(size == 0, "Contract not allowed");
         require(amount >= 1e6, "Minimum 1 USDT");
         require(expiresAt > block.timestamp, "Invalid expiry");
         require(expiresAt <= block.timestamp + maxExpiry, "Exceeds max expiry");
 
         require(usdt.transferFrom(who, address(this), amount), "Transfer failed");
 
-        Job storage job = jobs[jobCounter];
-        job.client = who;
-        job.depositAmount = amount;
-        job.expiresAt = expiresAt;
-        job.active = true;
+        uint256 newJobId = jobCounterId;
+        jobs[newJobId] = Job({
+            client: who,
+            depositAmount: amount,
+            expiresAt: expiresAt,
+            active: true,
+            cancelled: false,
+            finished: false,
+            selectedFreelancer: address(0),
+            reward: 0,
+            applicants: new address[](0)
+        });
 
-        // Mint soulbound NFT to client, tokenId = jobCounter
-        _safeMint(who, jobCounter);
-        _locked[jobCounter] = true; // Lock the NFT
+        // Mint soulbound NFT to client, tokenId = jobCounterId
+        _safeMint(who, newJobId);
+        _locked[newJobId] = true; // Lock the NFT
 
-        jobCounter++;
+        jobCounterId++;
 
-        emit JobPosted(jobCounter, who, amount, expiresAt);
+        emit JobPosted(newJobId, who, amount, expiresAt);
     }
 
     function cancelJob(uint256 jobId) external {
         Job storage job = jobs[jobId];
         require(_msgSender() == job.client, "Not job owner");
         require(job.active && !job.finished && !job.cancelled, "Job not cancellable");
+        require(block.timestamp < job.expiresAt, "Job expired");
 
         job.active = false;
         job.cancelled = true;
@@ -99,11 +121,15 @@ contract JobRoll is Ownable, ERC721, IERC5192 {
     }
 
     function submitWork(uint256 jobId) external {
+        address who = _msgSender();
         Job storage job = jobs[jobId];
+        require(freelancers[who].isFreelancer, "Not a registered freelancer");
+        require(!hasApplied[jobId][who], "Already applied");
         require(job.active, "Inactive job");
         require(block.timestamp < job.expiresAt, "Job expired");
+        require(job.applicants.length <= MAX_APPLICANTS, "Max applicants reached");
 
-        address who = _msgSender();
+        hasApplied[jobId][who] = true;
         job.applicants.push(who);
         emit WorkSubmitted(jobId, who);
     }
@@ -111,16 +137,9 @@ contract JobRoll is Ownable, ERC721, IERC5192 {
     function approveWork(uint256 jobId, address freelancer) external {
         Job storage job = jobs[jobId];
         require(_msgSender() == job.client, "Not job owner");
-        require(job.active && !job.finished, "Job closed");
+        require(job.active && !job.finished && block.timestamp < job.expiresAt, "Job closed");
 
-        bool isApplicant = false;
-        for (uint i = 0; i < job.applicants.length; i++) {
-            if (job.applicants[i] == freelancer) {
-                isApplicant = true;
-                break;
-            }
-        }
-        require(isApplicant, "Freelancer not applied");
+        require(hasApplied[jobId][freelancer], "Freelancer not applied");
 
         job.selectedFreelancer = freelancer;
         job.reward = job.depositAmount;
@@ -133,6 +152,21 @@ contract JobRoll is Ownable, ERC721, IERC5192 {
         freelancers[freelancer].withdrawableBalance += job.reward;
 
         emit JobApproved(jobId, freelancer, job.reward);
+    }
+
+    function claimUnfinishedJob(uint256 jobId) external {
+        Job storage job = jobs[jobId];
+        require(_msgSender() == job.client, "Not job owner");
+        require(job.active && !job.finished && !job.cancelled, "Job not claimable");
+        require(block.timestamp >= job.expiresAt, "Job not expired yet");
+
+        job.active = false;
+        job.cancelled = true;
+
+        require(usdt.transfer(job.client, job.depositAmount), "Refund failed");
+        _burn(jobId);
+
+        emit JobCancelled(jobId, job.depositAmount);
     }
 
     function withdraw() external {
@@ -167,7 +201,7 @@ contract JobRoll is Ownable, ERC721, IERC5192 {
     }
 
     function getActiveJobs(uint256 startId, uint256 endId) external view returns (uint256[] memory) {
-        require(startId <= endId && endId <= jobCounter, "Invalid range");
+        require(startId <= endId && endId <= jobCounterId, "Invalid range");
         uint256 count;
         for (uint256 i = startId; i <= endId; i++) {
             if (jobs[i].active) count++;
@@ -185,7 +219,7 @@ contract JobRoll is Ownable, ERC721, IERC5192 {
     }
 
     function getFinishedJobs(uint256 startId, uint256 endId) external view returns (uint256[] memory) {
-        require(startId <= endId && endId <= jobCounter, "Invalid range");
+        require(startId <= endId && endId <= jobCounterId, "Invalid range");
         uint256 count;
         for (uint256 i = startId; i <= endId; i++) {
             if (jobs[i].finished) count++;
@@ -203,7 +237,7 @@ contract JobRoll is Ownable, ERC721, IERC5192 {
     }
 
     function getCancelledJobs(uint256 startId, uint256 endId) external view returns (uint256[] memory) {
-        require(startId <= endId && endId <= jobCounter, "Invalid range");
+        require(startId <= endId && endId <= jobCounterId, "Invalid range");
         uint256 count;
         for (uint256 i = startId; i <= endId; i++) {
             if (jobs[i].cancelled) count++;
@@ -223,7 +257,7 @@ contract JobRoll is Ownable, ERC721, IERC5192 {
     // === Admin Functions ===
 
     function setWithdrawFee(uint256 _withdrawFee) external onlyOwner {
-        require(_withdrawFee <= 1000, "Too high"); // Max 10%
+        require(_withdrawFee <= 500, "Too high"); // Max 5%
         withdrawFee = _withdrawFee;
     }
 
@@ -233,6 +267,18 @@ contract JobRoll is Ownable, ERC721, IERC5192 {
     }
 
     function recoverTokens(address token, address to, uint256 amount) external onlyOwner {
+        require(token != address(usdt), "Cannot recover user funds");
         IERC20(token).transfer(to, amount);
+    }
+
+    function updateApprovalAddress(address newApprovalAddress) external onlyOwner {
+        require(newApprovalAddress != address(0), "Invalid address");
+        approvalAddress = newApprovalAddress;
+    }
+
+    function approveFreelancer(address freelancer) external {
+        require(_msgSender() == approvalAddress, "Not authorized");
+        require(freelancers[freelancer].isRegistered, "Freelancer not registered");
+        freelancers[freelancer].isFreelancer = true;
     }
 }
