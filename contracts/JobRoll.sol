@@ -4,7 +4,11 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 
-contract JobRoll is Ownable, ERC721 {
+interface IERC5192 {
+    function locked(uint256 tokenId) external view returns (bool);
+}
+
+contract JobRoll is Ownable, ERC721, IERC5192 {
     IERC20 private usdt;
 
     uint256 public withdrawFee;     // e.g. 50 = 0.5%
@@ -31,6 +35,7 @@ contract JobRoll is Ownable, ERC721 {
         uint256 withdrawableBalance;
     }
 
+    mapping(uint256 => bool) private _locked;
     mapping(uint256 => Job) public jobs;
     mapping(address => FreelancerInfo) public freelancers;
 
@@ -43,6 +48,10 @@ contract JobRoll is Ownable, ERC721 {
     constructor(address _usdt) Ownable(_msgSender()) ERC721("Job Roll", "JOBROLL") {
         usdt = IERC20(_usdt);
         jobCounter = 1; // Start job ID from 1
+    }
+
+    function locked(uint256 tokenId) external view override returns (bool) {
+        return _locked[tokenId];
     }
 
     function postJob(uint256 amount, uint256 expiresAt) external {
@@ -66,6 +75,7 @@ contract JobRoll is Ownable, ERC721 {
 
         // Mint soulbound NFT to client, tokenId = jobCounter
         _safeMint(who, jobCounter);
+        _locked[jobCounter] = true; // Lock the NFT
 
         jobCounter++;
 
@@ -140,9 +150,14 @@ contract JobRoll is Ownable, ERC721 {
         emit Withdrawn(who, finalAmount, fee);
     }
 
-    // Soulbound: prevent transfer
-    function _transfer(address from, address to, uint256 tokenId) internal pure override {
-        revert("Soulbound: transfer not allowed");
+    function transferFrom(address from, address to, uint256 tokenId) public override {
+        require(!_locked[tokenId], "Soulbound: token is locked and non-transferable");
+        super.transferFrom(from, to, tokenId);
+    }
+
+    function safeTransferFrom(address from, address to, uint256 tokenId, bytes memory data) public override {
+        require(!_locked[tokenId], "Soulbound: token is locked and non-transferable");
+        super.safeTransferFrom(from, to, tokenId, data);
     }
 
     // === View Functions ===
