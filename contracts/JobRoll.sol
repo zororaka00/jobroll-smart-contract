@@ -2,8 +2,9 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 
-contract JobRoll is Ownable {
+contract JobRoll is Ownable, ERC721 {
     IERC20 private usdt;
 
     uint256 public withdrawFee;     // e.g. 50 = 0.5%
@@ -39,17 +40,22 @@ contract JobRoll is Ownable {
     event JobApproved(uint256 indexed jobId, address indexed freelancer, uint256 reward);
     event Withdrawn(address indexed freelancer, uint256 netAmount, uint256 feeTaken);
 
-    constructor(address _usdt) Ownable(_msgSender()) {
+    constructor(address _usdt) Ownable(_msgSender()) ERC721("Job Roll", "JOBROLL") {
         usdt = IERC20(_usdt);
         jobCounter = 1; // Start job ID from 1
     }
 
     function postJob(uint256 amount, uint256 expiresAt) external {
-        require(amount >= 10e6, "Minimum 10 USDT");
+        address who = _msgSender();
+        uint32 size;
+        assembly {
+            size := extcodesize(who)
+        }
+        require(size == 0, "Contracts not allowed");
+        require(amount >= 1e6, "Minimum 1 USDT");
         require(expiresAt > block.timestamp, "Invalid expiry");
         require(expiresAt <= block.timestamp + maxExpiry, "Exceeds max expiry");
 
-        address who = _msgSender();
         require(usdt.transferFrom(who, address(this), amount), "Transfer failed");
 
         Job storage job = jobs[jobCounter];
@@ -57,6 +63,10 @@ contract JobRoll is Ownable {
         job.depositAmount = amount;
         job.expiresAt = expiresAt;
         job.active = true;
+
+        // Mint soulbound NFT to client, tokenId = jobCounter
+        _safeMint(who, jobCounter);
+
         jobCounter++;
 
         emit JobPosted(jobCounter, who, amount, expiresAt);
@@ -64,13 +74,16 @@ contract JobRoll is Ownable {
 
     function cancelJob(uint256 jobId) external {
         Job storage job = jobs[jobId];
-        require(msg.sender == job.client, "Not job owner");
+        require(_msgSender() == job.client, "Not job owner");
         require(job.active && !job.finished && !job.cancelled, "Job not cancellable");
 
         job.active = false;
         job.cancelled = true;
 
         require(usdt.transfer(job.client, job.depositAmount), "Refund failed");
+
+        // Burn the NFT when job is cancelled
+        _burn(jobId);
 
         emit JobCancelled(jobId, job.depositAmount);
     }
@@ -80,13 +93,14 @@ contract JobRoll is Ownable {
         require(job.active, "Inactive job");
         require(block.timestamp < job.expiresAt, "Job expired");
 
-        job.applicants.push(msg.sender);
-        emit WorkSubmitted(jobId, msg.sender);
+        address who = _msgSender();
+        job.applicants.push(who);
+        emit WorkSubmitted(jobId, who);
     }
 
     function approveWork(uint256 jobId, address freelancer) external {
         Job storage job = jobs[jobId];
-        require(msg.sender == job.client, "Not job owner");
+        require(_msgSender() == job.client, "Not job owner");
         require(job.active && !job.finished, "Job closed");
 
         bool isApplicant = false;
@@ -124,6 +138,11 @@ contract JobRoll is Ownable {
         require(usdt.transfer(who, finalAmount), "Withdraw failed");
 
         emit Withdrawn(who, finalAmount, fee);
+    }
+
+    // Soulbound: prevent transfer
+    function _transfer(address from, address to, uint256 tokenId) internal pure override {
+        revert("Soulbound: transfer not allowed");
     }
 
     // === View Functions ===
