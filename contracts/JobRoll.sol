@@ -41,6 +41,7 @@ contract JobRoll is Ownable {
 
     constructor(address _usdt) Ownable(_msgSender()) {
         usdt = IERC20(_usdt);
+        jobCounter = 1; // Start job ID from 1
     }
 
     function postJob(uint256 amount, uint256 expiresAt) external {
@@ -48,16 +49,17 @@ contract JobRoll is Ownable {
         require(expiresAt > block.timestamp, "Invalid expiry");
         require(expiresAt <= block.timestamp + maxExpiry, "Exceeds max expiry");
 
-        require(usdt.transferFrom(msg.sender, address(this), amount), "Transfer failed");
+        address who = _msgSender();
+        require(usdt.transferFrom(who, address(this), amount), "Transfer failed");
 
-        jobCounter++;
         Job storage job = jobs[jobCounter];
-        job.client = msg.sender;
+        job.client = who;
         job.depositAmount = amount;
         job.expiresAt = expiresAt;
         job.active = true;
+        jobCounter++;
 
-        emit JobPosted(jobCounter, msg.sender, amount, expiresAt);
+        emit JobPosted(jobCounter, who, amount, expiresAt);
     }
 
     function cancelJob(uint256 jobId) external {
